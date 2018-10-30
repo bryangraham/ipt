@@ -15,6 +15,14 @@ from .poisson import poisson
 from .iv import iv
 
 # Program evaluation estimators
+# (a) Partially linear model
 from .eplm import eplm
+
+# (b) General (scalar) treatment
+from .avreg_dr import avreg_dr
+from .avreg_ipw import avreg_ipw
+from .avreg_ob import avreg_ob
+
+# (c) Binary treatment
 from .att import att
 from .ipw_att import ipw_att

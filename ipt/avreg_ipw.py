@@ -16,9 +16,9 @@ from .poisson import poisson
 from .iv import iv
 
 
-# Define eplm() function
+# Define avreg_ipw function
 #-----------------------------------------------------------------------------#
-def eplm(Y, X, W, psmodel='normal', c_id=None, s_wgt=None, nocons=False, silent=False):
+def avreg_ipw(Y, X, W, psmodel='normal', c_id=None, s_wgt=None, silent=False):
     
     """
     AUTHOR: Bryan S. Graham, UC - Berkeley, bgraham@econ.berkeley.edu
@@ -26,74 +26,78 @@ def eplm(Y, X, W, psmodel='normal', c_id=None, s_wgt=None, nocons=False, silent=
     
     OVERVIEW
     --------
-    This function computes E-estimates of the coefficient on the scalar variable X (K=1)
-    which enters linearly in a partially linear model. The estimator is a variant of one 
-    due to Newey (1990, JAE) and Robins, Mark and Newey (1992, Biometrics). It is described 
-    by Graham (2018), who characterizes its local semiparametric efficiency and double
-    robustness properties.
-    
+    This function computes the average partial effect of X on Y using the generalized
+    "inverse probability weighting" estimator introduced by Wooldridge (2004).
+    The large sample properties of this estimator are derived and discussed
+    in Graham and Pinto (2018).
+     
     INPUTS:
     -------
     Y        : n X 1 pandas.Series of dependent variable
     X        : n X 1 pandas.Series of regressor entering linearly (i.e., policy variable)
                (currently program only accomodates a single "policy" variable)
-    W        : n X J pandas.DataFrame of (functions of) control variables
-    psmodel  : Model for e(W) = E[X|W], 'normal', 'logit' or 'poisson'
+    W        : n X J pandas.DataFrame of (functions of) control variables 
+    psmodel  : Model for f(X|W), 'normal', 'logit' or 'poisson'
     c_id     : n X 1 pandas.Series of unique `cluster' id values (assumed to be integer valued) (optional)
                NOTE: Default is to assume independent observations and report heteroscedastic robust 
                      standard errors
     s_wgt    : n X 1 pandas.Series of sampling weights variable (optional)
-    nocons   : If True, then do NOT add constant to W matrix
-                (only set to True if user passes in a dataframe with a constant included)
     silent   : if set equal to True, then suppress all outcome (optional)
+    
+    NOTE     : Neither X nor W should include a constant. This is added below.
         
     OUTPUTS:
     --------
-    beta_ehat          : K x 1 vector of coefficient estimates
-    vcov_beta_ehat     : K x K (cluster) Huber-robust variance-covariance estimate
+    beta_hat          : K x 1 vector of average coefficient estimates
+    vcov_beta_hat     : K x K (cluster) Huber-robust variance-covariance estimate
     
     FUNCTIONS CALLED  : ...ols(), logit(), poisson()...
     ----------------    
     """
     
-    def normal_ehat(X, W, s_wgt=None, nocons=False):
+    def normal_evhat(X, W, s_wgt=None, nocons=False):
         
-        # Compute ehat by normal mle (i.e., ols)
+        # Compute ehat and vhat by normal mle (i.e., ols)
         [pi_hat, _, H, S_i, ehat] = ols(X, W, c_id=None, s_wgt=s_wgt, nocons=nocons, silent=True)
+        vhat = np.var(X - ehat.flatten(), ddof=np.shape(W)[1])
+        vhat = np.full_like(ehat, vhat)
     
-        return [ehat, H, S_i]
+        return [ehat, vhat, H, S_i]
 
-    def logit_ehat(X, W, s_wgt=None, nocons=False):
+    def logit_evhat(X, W, s_wgt=None, nocons=False):
         
-        # Compute ehat by logit mle
+        # Compute ehat and vhat by logit mle
         [pi_hat, _, H, S_i, ehat, _] \
             = logit(X, W, s_wgt=s_wgt, nocons=nocons, c_id=None, silent=True, full=False)
+        vhat = ehat * (1-ehat)    
         
-        return [ehat, H, S_i]
+        return [ehat, vhat, H, S_i]
 
-    def poisson_ehat(X, W, s_wgt=None, nocons=False):
+    def poisson_evhat(X, W, s_wgt=None, nocons=False):
         
-        # Compute ehat by poisson mle
+        # Compute ehat and vhat by poisson mle
         [pi_hat, _, H, S_i, ehat, _] \
             = poisson(X, W, c_id=None, s_wgt=s_wgt, nocons=nocons, silent=True, full=False, phi_sv=None)
+        vhat = ehat
         
-        return [ehat, H, S_i]
+        return [ehat, vhat, H, S_i]
 
     #--------------------------------------------------------------------#
-    #- STEP 1 : Compute estimate of e(W) = E[X|W]                       -#
+    #- STEP 1 : Compute estimate of e(W) = E[X|W] and v(W) = V(X|W)     -#
     #--------------------------------------------------------------------#
     
-    psmodel_dict = {"normal": normal_ehat, "logit": logit_ehat, "poisson": poisson_ehat}
-    [ehat, H, S_i] = psmodel_dict[psmodel](X, W, s_wgt=s_wgt, nocons=nocons)
+    psmodel_dict = {"normal": normal_evhat, "logit": logit_evhat, "poisson": poisson_evhat}
+    [ehat, vhat, H, S_i] = psmodel_dict[psmodel](X, W, s_wgt=s_wgt, nocons=False)
     
     #--------------------------------------------------------------------#
-    #- STEP 2 : Organize data for E-estimation                          -#
+    #- STEP 2 : Organize data for average regression estimation         -#
     #--------------------------------------------------------------------#
     
     n       = len(Y)                     # Number of observations
     J       = W.shape[1]                 # Number of control variables
     K       = 1                          # Program only accomodates 1 policy variable/treatment
-                                         # in its current form
+                                         # in its current implementation
+    L       = 1 + J                      # Number of parameters in propensity score model                                     
     
     # Normalize weights to have mean one (if needed)
     if s_wgt is None:
@@ -106,36 +110,36 @@ def eplm(Y, X, W, psmodel='normal', c_id=None, s_wgt=None, nocons=False, silent=
     dep_var = Y.name                   # Get dependent variable names
     pol_var = X.name                   # Get policy variable name
     con_var = list(W.columns)          # Get control variable names
-    
+  
     #--------------------------------------------------------------------#
-    #- STEP 3 : Compute E-estimate of beta                              -#
+    #- STEP 3 : Compute average regression estimate of beta             -#
     #--------------------------------------------------------------------#
     
-    X = pd.DataFrame(data = X, columns=[pol_var])
-    Z = pd.DataFrame(data = X[pol_var].values.reshape((n,1)) - ehat, columns=["X - e(W)"])
-    
-    [beta_ehat, vcov_beta_hat, _] = iv(Y, X, Z, c_id=c_id, s_wgt=s_wgt, nocons=True, silent=True)
+    # Calculate Wooldridge's (2004) (generalized) IPW estimator
+    gw = sw*(X.values.reshape((n,1)) - ehat)/vhat
+    beta_hat = np.sum(gw*Y.values.reshape((n,1)))/np.sum(gw*X.values.reshape((n,1))).reshape(-1,1)
     
     #--------------------------------------------------------------------#
     #- STEP 4 : Compute variance-covariance matrix                      -#
     #--------------------------------------------------------------------#
+          
+    # Compute influence function of estimator
+    m = (gw*(Y.values.reshape((n,1)) - X.values.reshape((n,1)) @ beta_hat)).reshape(-1,1)
+       
+    # Compute PI_ms (divide by sw to get sample weighting right since S_i is already weighted)  
+    ss  = (S_i/sw).T @ S_i
+    sm  = (S_i/sw).T @ m 
+    PI_ms = numpy.linalg.solve(ss, sm)
     
-    Y       = Y.values.reshape((n,1))  # Turn pandas.Series into n x 1 numpy array
-    X       = X.values.reshape((n,K))  # Turn pandas.DataFrame into n x K numpy array
-    Z       = Z.values.reshape((n,K))  # Turn pandas.DataFrame into n x J numpy array
+    # Influence function ("Residualized moment")
+    m_tilde = m - S_i @ PI_ms
     
-    m_i       = sw * Z * (Y - X @ beta_ehat)   # Estimating moment
-    SS        = S_i.T @ S_i                    # Compute projection of moment on to e(W) scores
-    Sm        = S_i.T @ m_i
-    pi_hat    = np.linalg.solve(SS, Sm)        # J x 1 vector of projection coefficients
-    m_i_tilde = m_i - S_i @ pi_hat             # n x 1 vector of residualized moments
-                                               # (accounts for two-step estimation)
-    
+    # Compute covariance matrix of the scores
     if c_id is None: 
         
         # Compute variance-covariance matrix of moments (unclustered)
-        fsc   = n/(n-K-J)                                   # Finite-sample correction factor
-        omega = fsc*(m_i_tilde.T @ m_i_tilde)               # K X K variance-covariance of the residualized moments
+        fsc           = n/(n-L-K)                                   # Finite-sample correction factor
+        vcov_beta_hat = fsc*(m_tilde.T @ m_tilde)/(n**2)            # variance-covariance of the full moment vector
         
     else:
         
@@ -145,26 +149,21 @@ def eplm(Y, X, W, psmodel='normal', c_id=None, s_wgt=None, nocons=False, silent=
         
         # Calculate cluster-robust variance-covariance matrix of moments
         # Sum score vector within clusters
-        sum_m_tilde = np.empty((N,K))
+        sum_m = np.empty((N,K))
     
         for c in range(0,N):
-            b_cluster        = np.nonzero((c_id == c_list[c]))[0]                           # Indices of observations in c-th cluster 
-            sum_m_tilde[c,:] = np.sum(m_i_tilde[np.ix_(b_cluster, range(0,K))], axis = 0)   # Sum over rows within c-th cluster
+            b_cluster  = np.nonzero((c_id == c_list[c]))[0]                        # Indices of observations in c-th cluster 
+            sum_m[c,:] = np.sum(m_tilde[np.ix_(b_cluster, range(0,K))], axis = 0)  # Sum over rows within c-th cluster
             # NOTE: Above line uses "open mesh" numpy indexing, see documentation
             
-        # Compute variance-covariance matrix of residualized moments (clustered)
-        fsc   = (n/(n-K-J))*(N/(N-1))                       # Finite-sample correction factor
-        omega = fsc*(sum_m_tilde.T @ sum_m_tilde)           # K X K variance-covariance of the summed residualized moments
-    
-    # Compute Jacobian matrix
-    v_W  = (sw * Z).T @ X                                   
-    iv_W = np.linalg.inv(v_W)
-    vcov_beta_ehat = iv_W @ omega @ iv_W.T                  
-    
+        # Compute variance-covariance matrix of summed moments (clustered)
+        fsc           = (n/(n-L-K))*(N/(N-1))             # Finite-sample correction factor
+        vcov_beta_hat = fsc*(sum_m.T @ sum_m)/(N**2)      # variance-covariance of the full summed moment vector
+        
     if not silent:
         print("")
         print("-----------------------------------------------------------------------")
-        print("-                    E-ESTIMATION RESULTS                             -")
+        print("-   GENERALIZED IPW AVERAGE REGRESSION ESTIMATION RESULTS             -")
         print("-----------------------------------------------------------------------")
         print("Dependent variable:        " + dep_var)
         print("Number of observations, n: " + "%0.0f" % n)
@@ -172,7 +171,7 @@ def eplm(Y, X, W, psmodel='normal', c_id=None, s_wgt=None, nocons=False, silent=
         print("")
         
         # Print coefficient estimate, standard error and 95 percent confidence interval
-        print_coef(beta_ehat, vcov_beta_ehat, var_names=[pol_var], alpha=0.05)
+        print_coef(beta_hat, vcov_beta_hat, var_names=[pol_var], alpha=0.05)
        
         
         if c_id is None:
@@ -192,4 +191,6 @@ def eplm(Y, X, W, psmodel='normal', c_id=None, s_wgt=None, nocons=False, silent=
             print(control.ljust(25))
         print("")
     
-    return [beta_ehat, vcov_beta_ehat]
+    return [beta_hat, vcov_beta_hat]        
+    
+    
